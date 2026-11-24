@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>冷库需量峰值核账</title>
+<style>
+  :root { --bd:#d0d7de; --bg:#f6f8fa; --ok:#1a7f37; --err:#cf222e; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 0; padding: 24px; color:#1f2328; }
+  h1 { font-size: 20px; } h2 { font-size: 16px; margin-top: 28px; }
+  .card { border:1px solid var(--bd); border-radius:8px; padding:16px;
+          margin-bottom:16px; background:#fff; }
+  table { border-collapse: collapse; width:100%; font-size:13px; }
+  th,td { border:1px solid var(--bd); padding:6px 10px; text-align:left; }
+  th { background:var(--bg); }
+  input { padding:6px 8px; border:1px solid var(--bd); border-radius:6px;
+          margin-right:12px; }
+  button { padding:7px 16px; border:0; border-radius:6px; background:#0969da;
+           color:#fff; cursor:pointer; }
+  button.ghost { background:#6e7781; }
+  .flash { padding:10px 14px; border-radius:6px; margin-bottom:12px; font-size:14px; }
+  .flash.ok { background:#dafbe1; color:var(--ok); border:1px solid #aceebb; }
+  .flash.error { background:#ffebe9; color:var(--err); border:1px solid #ff8182; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:12px; }
+  .b-feasible { background:#dafbe1; color:var(--ok); }
+  .b-target_unreachable, .b-others_breach { background:#ffebe9; color:var(--err); }
+  .muted { color:#6e7781; font-size:12px; }
+  .rep { font-weight:700; background:#fff8c5; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  code { background:var(--bg); padding:1px 5px; border-radius:4px; }
+</style>
+</head>
+<body>
+<h1>冷库需量账单峰值核账（单表单期）</h1>
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% for cat, msg in messages %}
+    <div class="flash {{ cat }}">{{ msg }}</div>
+  {% endfor %}
+{% endwith %}
+
+<div class="card">
+  <h2 style="margin-top:0">1. 上传整分钟累计读数 CSV</h2>
+  <p class="muted">表头 <code>timestamp,reading</code>，整数 Wh，整分钟；账期内可补传，同刻覆盖。
+     合并后若回卷或超每分钟上限无解，整批拒绝，库内数据与结论不变。</p>
+  <form method="post" action="{{ url_for('upload') }}" enctype="multipart/form-data">
+    <input type="file" name="csv" accept=".csv,text/csv" required>
+    <button type="submit">上传 / 补传</button>
+  </form>
+  {% if readings %}
+    <p class="muted">当前 {{ readings|length }} 条读数，账期：
+      {{ readings[0][0].strftime('%Y-%m-%d %H:%M') }} →
+      {{ readings[-1][0].strftime('%Y-%m-%d %H:%M') }}
+      （{{ ((readings[-1][0] - readings[0][0]).total_seconds() / 60)|int }} 分钟）</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">2. 填写核对参数</h2>
+  <form method="post" action="{{ url_for('audit') }}">
+    <label>每分钟用电上限 (Wh)
+      <input name="per_minute_cap" type="number" min="1" required
+             value="{{ cfg.per_minute_cap or '' }}"></label>
+    <label>账单峰值 (Wh)
+      <input name="peak_wh" type="number" min="0" required
+             value="{{ cfg.peak_wh or '' }}"></label>
+    <label>所报 15 分钟时段起点
+      <input name="reported_window" placeholder="2026-11-01 08:15"
+             value="{{ cfg.reported_window or '' }}" required></label>
+    <button type="submit">核对</button>
+  </form>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h2 style="margin-top:0">初核结论（保留）</h2>
+    {% if initial %}
+      <span class="badge b-{{ initial.status }}">{{ initial.status }}</span>
+      <p>{{ initial.message }}</p>
+      <p class="muted">生成于 {{ initial.created_ts }}</p>
+    {% else %}<p class="muted">尚无结论</p>{% endif %}
+  </div>
+  <div class="card">
+    <h2 style="margin-top:0">当前结论（随读数/参数更新）</h2>
+    {% if current %}
+      <span class="badge b-{{ current.status }}">{{ current.status }}</span>
+      <p>{{ current.message }}</p>
+      <p class="muted">生成于 {{ current.created_ts }}</p>
+      {% if current_result and current_result.status == 'target_unreachable' %}
+        <p>所报窗可达区间：[{{ current_result.target_min }},
+           {{ current_result.target_max }}] Wh</p>
+      {% endif %}
+      {% if current_result and current_result.status == 'others_breach' %}
+        <p>最小越限总量：{{ current_result.min_overflow }} Wh；
+           被迫越限窗索引：{{ current_result.breach_windows }}</p>
+      {% endif %}
+    {% else %}<p class="muted">尚无结论</p>{% endif %}
+  </div>
+</div>
+
+{% if windows %}
+<div class="card">
+  <h2 style="margin-top:0">3. 全期各 15 分钟时段电量（Wh）</h2>
+  <p><a href="{{ url_for('windows_csv') }}">导出 windows.csv</a></p>
+  <table>
+    <tr><th>窗起点</th><th>窗索引</th><th>电量 (Wh)</th><th>所报时段</th></tr>
+    {% for ts, wh, i, flag in windows %}
+    <tr {% if flag %}class="rep"{% endif %}>
+      <td>{{ ts }}</td><td>{{ i }}</td><td>{{ wh }}</td>
+      <td>{{ "是" if flag else "" }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
+
+{% if readings %}
+<div class="card">
+  <h2 style="margin-top:0">库内读数</h2>
+  <table>
+    <tr><th>分钟</th><th>累计读数 (Wh)</th></tr>
+    {% for ts, v in readings %}
+    <tr><td>{{ ts.strftime('%Y-%m-%d %H:%M') }}</td><td>{{ v }}</td></tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
+
+<form method="post" action="{{ url_for('reset') }}"
+      onreturn="return confirm('确认清空？')">
+  <button class="ghost" type="submit"
+          onclick="return confirm('确认清空全部读数、参数与结论？')">
+    清空重置</button>
+</form>
+</body>
+</html>

@@ -1,0 +1,16 @@
+services:
+  demand-audit:
+    build: .
+    image: demand-audit:latest
+    container_name: demand-audit
+    ports:
+      - "8000:8000"
+    environment:
+      DB_PATH: /data/meter.db
+      SECRET_KEY: change-me-in-production
+    volumes:
+      - meter-data:/data
+    restart: unless-stopped
+
+volumes:
+  meter-data:
